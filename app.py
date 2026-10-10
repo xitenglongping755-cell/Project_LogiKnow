@@ -1,14 +1,24 @@
-"""LogiKnow（ロジノウ）― 物流版・暗黙知継承AI  UIモック
+"""LogiKnow（ロジノウ）― 物流版・暗黙知継承アプリ
 
-見た目だけのapp.py。DB・検索などの処理は持たない（他メンバーが別ファイルで実装予定）。
-画面に出ているデータはすべて表示確認用のダミー。
+使い方は2段構え（10/10 チームMTGで決定）
+    ステップ1：配送前チェック … 行き先と時間を入れると、その行き先で気をつけることを新しい順に表示
+    ステップ2：トラブル検索   … 配送中に困ったことを入力すると、4つの情報源から解決策を探す
+
+処理の流れ
+    app.py（入力）→ search_service.py → query_processor.py（質問の加工）
+                  → ranking.py（情報源ごとの検索エンジン）→ app.py（表示）
 
 streamlit run app.py
 """
 
-from datetime import date
+from datetime import datetime, time
 
+import pandas as pd
 import streamlit as st
+
+import database as db
+from ranking import SearchEngine
+from search_service import LAYERS, search_all_sources
 
 st.set_page_config(
     page_title="LogiKnow v0.1",
@@ -16,179 +26,279 @@ st.set_page_config(
     layout="wide"
 )
 
-MVP_CATEGORY = "C. トラブル一次対応"
-LAYERS = [  # 3層回答構成
-    ("manual", "✅ 推奨対応", "社内マニュアル出典"),
-    ("report", "📄 類似事例", "クレーム・事故報告書出典"),
-    ("experience", "🧓 ベテランの注意", "経験知出典"),
+# 表示順は固定（10/10 MTGで決定）：報告書 → 経験値 → 現地ルール → マニュアル
+DISPLAY = [
+    ("report", "📄 トラブル報告（類似事例）"),
+    ("experience", "🧓 ベテランの経験値"),
+    ("local_rule", "📍 現地ルール"),
+    ("manual", "📘 マニュアル"),
 ]
+MIN_SCORE = 5.0          # トラブル検索で表示する関連度の下限（これ未満はほぼ無関係なので出さない）
+RECENT_DAYS = 30         # 配送前チェックで表示する報告書・経験値の期間
+TIME_BANDS = ["早朝", "日中", "夜間"]
 
-# ── ダミーデータ（表示確認用。実装時にDB・検索処理の結果に置き換える） ───────
-DUMMY_CATEGORIES = [MVP_CATEGORY]
-DUMMY_LOCATIONS = ["北関東物流センター", "東部食品センター"]
-DUMMY_DRIVERS = ["山田 一郎", "鈴木 正夫", "佐藤 健二", "田中 美咲"]
-DUMMY_VETERANS = ["山田 一郎", "鈴木 正夫", "佐藤 健二"]
-DUMMY_ENTRIES = [
-    {"layer": "manual", "content": "（サンプル）推奨対応の本文がここに入ります。",
-     "reason": "（サンプル）理由がここに入ります。", "confidence": "高",
-     "source": "社内マニュアル", "source_ref": "運行マニュアル 第◯章", "location": "", "creator": "", "endorse": 0},
-    {"layer": "report", "content": "（サンプル）類似事例の本文がここに入ります。",
-     "reason": "（サンプル）教訓がここに入ります。", "confidence": "高",
-     "source": "クレーム・事故報告書", "source_ref": "報告書 #◯◯", "location": "北関東物流センター", "creator": "", "endorse": 0},
-    {"layer": "experience", "content": "（サンプル）ベテランの注意の本文がここに入ります。",
-     "reason": "（サンプル）理由がここに入ります。", "confidence": "要確認",
-     "source": "ベテランの経験知", "source_ref": "配送終了ヒアリング", "location": "", "creator": "山田 一郎", "endorse": 1},
-]
-DUMMY_GAPS = [
-    {"query": "（サンプル）答えられなかった質問がここに入ります。", "asker": "匿名",
-     "asked_at": "2026-10-01", "assignee": "鈴木 正夫", "tenure": 28},
-]
-DUMMY_LOG = [
-    {"日時": "2026-10-01 09:00", "質問者": "匿名", "質問": "（サンプル）質問文", "ヒット数": 3, "結果": "解決"},
-    {"日時": "2026-10-01 10:30", "質問者": "匿名", "質問": "（サンプル）質問文", "ヒット数": 0, "結果": "未解決"},
-]
 
+# ── DB と検索エンジン（アプリ起動中は使い回す） ───────────────────────
+@st.cache_resource
+def get_conn():
+    conn = db.connect()
+    db.init_db(conn)        # DBが無ければ作って、サンプルデータを入れる
+    return conn
+
+
+@st.cache_resource
+def get_engines():
+    """情報源ごとに検索エンジンを1つずつ作る"""
+    engines = {}
+    for layer in LAYERS:
+        engine = SearchEngine()
+        engine.build_index(db.get_pages(get_conn(), layer))
+        engines[layer] = engine
+    return engines
+
+
+def refresh_engines():
+    """ナレッジを登録・評価したら、検索エンジンを作り直す"""
+    get_engines.clear()
+
+
+def to_band(t: time) -> str:
+    """到着時刻を時間帯に変換する"""
+    if 4 <= t.hour < 8:
+        return "早朝"
+    if 8 <= t.hour < 17:
+        return "日中"
+    return "夜間"
+
+
+def days_ago(created: str) -> str:
+    try:
+        d = (datetime.now() - datetime.fromisoformat(created)).days
+    except ValueError:
+        return ""
+    return "今日" if d == 0 else f"{d}日前"
+
+
+conn = get_conn()
+master = db.master()
+LOCATIONS = master["locations"]
 
 # ── ヘッダー ──────────────────────────────────────────────────
 st.title("🚚  :blue[LogiKnow v0.1] ")
 st.caption("ベテランの経験を、全員の経験に。— 物流版ナレッジ検索ツール")
 
-# ── サイドバー ────────────────────────────────────────────────
+# ── 今日の配送（全タブ共通の入力）────────────────────────────────
+# スマホではサイドバーが隠れて見えないので、タブの上に置く。押すと開く。
+st.session_state.setdefault("driver", master["drivers"][0])
+st.session_state.setdefault("destination", LOCATIONS[0])
+st.session_state.setdefault("arrival", time(9, 0))
+_label_time = st.session_state["arrival"].strftime("%H:%M")
+with st.expander(f"🚚 今日の配送：{st.session_state['destination']}　{_label_time}　{st.session_state['driver']}"):
+    destination = st.selectbox("行き先", LOCATIONS, key="destination")
+    arrival = st.time_input("到着予定時刻", step=1800, key="arrival")
+    driver = st.selectbox("ドライバー", master["drivers"], key="driver")
+band = to_band(arrival)
+
+# ── サイドバー：DBの状態 ──────────────────────────────────────
 with st.sidebar:
     st.header("DB の登録状況")
-    st.metric("ナレッジ登録数", "– 件")   # TODO: 登録件数
-    st.metric("未回答の質問", "– 件")     # TODO: 未回答ギャップ件数
+    s = db.stats(conn)
+    st.metric("ナレッジ登録数", f"{sum(s['by_layer'].values())} 件")
+    st.metric("未回答の質問", f"{s['open_questions']} 件")
 
 
-def confidence_badge(level):
-    return ":green[信頼度：高]" if level == "高" else ":orange[信頼度：要確認]"
-
-
-def entry_card(e, key):
-    """ナレッジ1件のカード。"""
+# ── ナレッジ1件のカード ─────────────────────────────────────────
+def entry_card(e, key, show_score=False):
     with st.container(border=True):
+        st.markdown(f"**{e['title']}**")
         st.markdown(e["content"])
         if e["reason"]:
             st.markdown(f"**なぜ：** {e['reason']}")
-        meta = [confidence_badge(e["confidence"]), f"出典：{e['source']}", e["source_ref"]]
-        if e["location"]:
-            meta.append(f"📍{e['location']}")
-        if e["layer"] == "experience":
-            meta.append(f"登録：{e['creator']}／同意 {e['endorse']}名")
+        meta = [f"出典：{e['source']}"]
+        if e["source_ref"]:
+            meta.append(e["source_ref"])
+        meta.append(f"📍{e['location']}" if e["location"] else "📍共通")
+        if e["time_band"]:
+            meta.append(f"🕐{e['time_band']}")
+        if e["created_at"]:
+            meta.append(f"登録：{days_ago(e['created_at'])}")
+        if e["creator"]:
+            meta.append(e["creator"])
+        if show_score:
+            meta.append(f"関連度 {e['relevance_score']}")
         st.caption("　".join(meta))
-        if e["layer"] == "experience":
-            with st.popover("👍 自分もそう思う（同意）"):
-                st.selectbox("同意するベテラン", DUMMY_VETERANS, key=f"who_{key}")
-                st.button("同意する", key=f"endorse_{key}", type="primary")  # TODO: 同意を記録
+        if st.button(f"👍 役に立った（{e['helpful']}）", key=f"{key}_helpful_{e['id']}"):
+            db.add_helpful(conn, e["id"])
+            refresh_engines()
+            st.toast("ありがとうございます。評価を記録しました")
+            st.rerun()
+
+
+def show_results(results, key, show_score=False, empty_text=None):
+    """4つの情報源の結果を、決まった順番で表示する"""
+    for layer, heading in DISPLAY:
+        items = results.get(layer, [])
+        st.markdown(f"#### {heading}　<small>{len(items)}件</small>", unsafe_allow_html=True)
+        if not items:
+            st.caption((empty_text or {}).get(layer, "該当なし"))
+        for e in items:
+            entry_card(e, key=f"{key}_{layer}", show_score=show_score)
 
 
 # ── タブ ──────────────────────────────────────────────────────
-tab_search, tab_register, tab_gap, tab_stats = st.tabs(
-    ["🔍 検索", "📝 登録", "❓ 質問", "📊 活用状況・効果測定"]
+tab_pre, tab_search, tab_register, tab_question, tab_stats = st.tabs(
+    ["🚚 配送前チェック", "🔍 トラブル検索", "📝 登録", "❓ 質問", "📊 活用状況"]
 )
 
-# ── 検索タブ ───────────────────────────────────────────────────
+# ── ステップ1：配送前チェック ──────────────────────────────────
+with tab_pre:
+    st.subheader("配送前チェック")
+    st.caption("エンジンをかける前に、行き先で気をつけることを確認しましょう。検索ワードは不要です。")
+    st.info(f"**{destination}**　到着予定 {arrival.strftime('%H:%M')}（{band}）　※上の「今日の配送」で変更できます")
+
+    pre = search_all_sources("", location=destination, engines=get_engines(), locations=LOCATIONS,
+                             time_band=band, recent_days=RECENT_DAYS)
+    total = sum(len(v) for v in pre.values())
+
+    # 同じ条件での記録は1回だけ（画面の再実行のたびに数えないため）
+    logged = st.session_state.setdefault("precheck_logged", set())
+    if (driver, destination, band) not in logged:
+        db.log_search(conn, "precheck", "", destination, total, driver)
+        logged.add((driver, destination, band))
+
+    st.markdown(f"**{destination}** の注意事項：{total} 件（新しい順）")
+    show_results(pre, key="pre", empty_text={
+        "report": f"直近{RECENT_DAYS}日のトラブル報告はありません",
+        "experience": f"直近{RECENT_DAYS}日のベテランの経験値はありません",
+        "local_rule": "この行き先の現地ルールは、まだ登録されていません",
+        "manual": "マニュアルは「トラブル検索」で表示します",
+    })
+
+# ── ステップ2：トラブル検索 ────────────────────────────────────
 with tab_search:
-    st.subheader("困ったときに検索")
-    st.caption("関連ワードにてまずここで検索。")
+    st.subheader("トラブル検索")
+    st.caption("配送中に困ったことを入力してください。言い回しが違っても関連語で探します。")
     with st.form("search"):
-        col_search, col_cat, col_loc = st.columns([3, 1, 1])
-        with col_search:
-            q = st.text_input("何に困っていますか？", placeholder="例：個数が違う／荷姿が崩れていた／お客様が怒っている")
-        with col_cat:
-            cat = st.selectbox("カテゴリ", ["すべて"] + DUMMY_CATEGORIES, index=1)
-        with col_loc:
-            loc = st.selectbox("配送先", ["指定なし"] + DUMMY_LOCATIONS)
+        q = st.text_input("何に困っていますか？", placeholder="例：数が合わないと言われた")
+        use_dest = st.checkbox(f"行き先（{destination}・{band}）で絞り込む", value=True)
         submitted = st.form_submit_button("検索", type="primary")
-        st.caption("配送先だけ選んで検索すると、その配送先のナレッジを一覧で表示します。")
 
-    if submitted and (q.strip() or loc != "指定なし"):
-        # TODO: 検索処理を呼び、結果を受け取る。いまは常にダミー結果を表示
-        title = f"「{q}」の検索結果" if q.strip() else f"📍 {loc} のナレッジ"
-        st.markdown(f"**📊 {title}：{len(DUMMY_ENTRIES)} 件**（表示サンプル）")
-        for layer, heading, origin in LAYERS:
-            st.markdown(f"#### {heading}　<small>{origin}</small>", unsafe_allow_html=True)
-            for i, e in enumerate(x for x in DUMMY_ENTRIES if x["layer"] == layer):
-                entry_card(e, key=f"{layer}{i}")
+    if submitted and q.strip():
+        res = search_all_sources(q, location=destination if use_dest else "指定なし", engines=get_engines(),
+                                 locations=LOCATIONS, time_band=band if use_dest else None)
+        res = {layer: [e for e in items if e["relevance_score"] >= MIN_SCORE] for layer, items in res.items()}
+        hits = sum(len(v) for v in res.values())
+        db.log_search(conn, "search", q, destination if use_dest else "", hits, driver)
+        st.session_state.last = {"q": q, "ids": {l: [e["id"] for e in v] for l, v in res.items()},
+                                 "res": res, "asked": False}
+
+    last = st.session_state.get("last")
+    if last:
+        hits = sum(len(v) for v in last["res"].values())
+        st.markdown(f"**「{last['q']}」の検索結果：{hits} 件**（関連度の高い順）")
+        if hits == 0:
+            st.warning("まだこの質問に答えられるナレッジがありません。急ぎの場合は営業所へ連絡してください。")
+        else:
+            show_results(last["res"], key="srch", show_score=True)
         st.divider()
-        st.markdown("**この回答で解決しましたか？**")
-        c1, c2 = st.columns(2)
-        c1.button("✅ 解決した", use_container_width=True)        # TODO: 自己解決を記録
-        c2.button("❌ 解決しなかった", use_container_width=True)  # TODO: 未解決を記録・ベテランへの質問を作成
-        with st.expander("0件のときの表示（サンプル）"):
-            st.warning("まだこの質問に答えられるナレッジがありません。")
-            st.info("この質問は「ギャップ」として記録し、**◯◯** さんに次の配送終了時に聞いておきます。"
-                    "急ぎの場合は営業所へ連絡してください。")
+        if last["asked"]:
+            st.success("ベテランに質問を送りました。「❓ 質問」タブで回答を待ちます。")
+        elif st.button("🙋 解決しなかったら、ベテランに質問する", use_container_width=True):
+            db.add_question(conn, last["q"], destination, band, driver)
+            last["asked"] = True
+            st.rerun()
 
-# ── 登録タブ ───────────────────────────────────────────────────
+# ── 登録 ──────────────────────────────────────────────────────
 with tab_register:
-    mode = st.radio("登録の種類", ["配送終了ヒアリング（ドライバー）", "マニュアル・報告書の取り込み（管理部門）"],
-                    horizontal=True, label_visibility="collapsed")
+    st.subheader("ナレッジを登録")
+    kinds = {"ベテランの経験値": "experience", "現地ルール": "local_rule",
+             "トラブル報告": "report", "マニュアル": "manual"}
+    kind = st.radio("種類", list(kinds), horizontal=True)
+    layer = kinds[kind]
+    if layer in ("experience", "local_rule"):
+        st.caption(f"登録者：{driver}（上の「今日の配送」で変更できます）")
+    with st.form("register", clear_on_submit=True):
+        title = st.text_input("タイトル", placeholder="例：数が合わないときはまず荷台の奥を確認")
+        content = st.text_area("内容（どうする）")
+        reason = st.text_area("理由・教訓（なぜ）")
+        loc = st.selectbox("配送先", ["（共通）"] + LOCATIONS,
+                           index=(LOCATIONS.index(destination) + 1) if layer == "local_rule" else 0)
+        tb = st.selectbox("時間帯", ["（問わない）"] + TIME_BANDS)
+        category = st.selectbox("カテゴリ", master["categories"])
+        keywords = st.text_input("キーワード（カンマ区切り・任意）", placeholder="例：数量,個数")
+        source_ref = st.text_input("出典（任意）", placeholder="例：運行マニュアル 第4章／報告書 R-0912")
+        ok = st.form_submit_button("登録する", type="primary")
+    if ok:
+        if not title.strip() or not content.strip():
+            st.error("タイトルと内容を入力してください。")
+        elif layer == "local_rule" and loc == "（共通）":
+            st.error("現地ルールは配送先を選んでください。")
+        else:
+            db.add_knowledge(conn, layer, title.strip(), content.strip(), reason.strip(), category,
+                             "" if loc == "（共通）" else loc, "" if tb == "（問わない）" else tb,
+                             keywords.strip(), source_ref.strip(),
+                             driver if layer in ("experience", "local_rule") else "")
+            refresh_engines()
+            st.success(f"「{kind}」に登録しました。ありがとうございます！")
 
-    if mode.startswith("配送終了"):
-        st.subheader("配送終了ヒアリング")
-        st.info("💬 ベテランへの質問が ◯ 件届いています。「❓ 質問」タブから答えてもらえると助かります。")
-        st.caption("今日の配送で「次の人に伝えたいこと」を1つだけ教えてください。声でも文字でもOKです。")
-        st.audio_input("🎤 音声で入力（β）")  # TODO: 文字起こしして「気づいたこと」欄へ反映
-        with st.form("report"):
-            c1, c2 = st.columns(2)
-            c1.selectbox("運転者名", DUMMY_DRIVERS)
-            c2.date_input("運行日", value=date.today())
-            c1.text_input("納品先（任意）", placeholder="例：北関東物流センター")
-            c2.text_input("カテゴリ（自由タグ）", value=MVP_CATEGORY)
-            st.text_area("気づいたこと（こうする）", placeholder="例：数が合わないときは、まず荷台の奥を確認する")
-            st.text_area("なぜそうするのか（理由）", placeholder="例：積み残しより荷台内の見落としの方が多いから")
-            st.form_submit_button("登録する", type="primary")  # TODO: ナレッジを登録
-    else:
-        st.subheader("マニュアル・報告書の取り込み")
-        st.caption("社内マニュアル・クレーム／事故／ヒヤリハット報告書を構造化して登録します。")
-        with st.form("import"):
-            st.radio("情報源", ["社内マニュアル", "クレーム・事故報告書"], horizontal=True)
-            st.text_input("カテゴリ（自由タグ）", value=MVP_CATEGORY)
-            st.text_area("内容（推奨対応／事例の概要）")
-            st.text_area("理由・教訓")
-            c1, c2 = st.columns(2)
-            c1.text_input("関連する納品先（任意）")
-            c2.text_input("出典（文書名・報告書番号）")
-            st.form_submit_button("登録", type="primary")  # TODO: マニュアル・報告書を登録
-
-# ── 質問タブ ──────────────────────────────────────────────────
-with tab_gap:
-    st.subheader("ベテランへの質問（ギャップ）")
-    st.caption("LogiKnowが答えられなかった質問です。ベテランに答えてもらい、次の人のナレッジにします。")
-    for i, g in enumerate(DUMMY_GAPS):  # TODO: 未回答の質問一覧
+# ── 質問（答えが見つからなかったもの） ──────────────────────────
+with tab_question:
+    st.subheader("ベテランへの質問")
+    st.caption("LogiKnowで答えが見つからなかった質問です。ベテランの回答は、そのまま経験値として登録されます。")
+    questions = db.open_questions(conn)
+    if not questions:
+        st.success("未回答の質問はありません。")
+    for item in questions:
         with st.container(border=True):
-            st.markdown(f"**Q. {g['query']}**")
-            st.caption(f"質問者：{g['asker']}　{g['asked_at']}　／　担当：{g['assignee']}（勤続{g['tenure']}年）")
+            st.markdown(f"**Q. {item['question']}**")
+            st.caption(f"質問者：{item['asked_by']}　📍{item['location'] or '共通'}　🕐{item['time_band'] or '－'}"
+                       f"　{days_ago(item['asked_at'])}")
             with st.expander("回答する"):
-                with st.form(f"gap{i}"):
-                    st.selectbox("回答者", DUMMY_VETERANS)
-                    st.text_area("こうする")
-                    st.text_area("なぜ")
-                    st.form_submit_button("回答を登録", type="primary")  # TODO: 回答をナレッジとして登録
+                with st.form(f"answer{item['id']}"):
+                    answerer = st.selectbox("回答者", master["veterans"])
+                    a_title = st.text_input("タイトル", value=item["question"])
+                    a_content = st.text_area("どうする")
+                    a_reason = st.text_area("なぜ")
+                    if st.form_submit_button("回答を登録", type="primary"):
+                        if a_content.strip():
+                            kid = db.add_knowledge(conn, "experience", a_title.strip(), a_content.strip(),
+                                                   a_reason.strip(), "", item["location"] or "",
+                                                   item["time_band"] or "", "", "質問への回答", answerer)
+                            db.answer_question(conn, item["id"], kid)
+                            refresh_engines()
+                            st.rerun()
+                        else:
+                            st.error("「どうする」を入力してください。")
 
-# ── 活用状況・効果測定タブ ──────────────────────────────────────
+# ── 活用状況・効果測定 ─────────────────────────────────────────
 with tab_stats:
-    st.subheader("ドライバー別の活用状況")
-    st.caption("登録したナレッジが何回検索で役立ったかを表示します（プラスの実績のみ）。")
-    st.selectbox("ドライバー", DUMMY_DRIVERS)
-    c1, c2, c3 = st.columns(3)   # TODO: 選んだドライバーの実績
-    c1.metric("登録数", "–")
-    c2.metric("検索で表示された回数", "–")
-    c3.metric("他のベテランの同意", "–")
-    with st.container(border=True):
-        st.markdown("（サンプル）登録したナレッジの本文がここに入ります。")
-        st.caption(f"🔍 ◯回表示　👍 同意 ◯名　{confidence_badge('高')}")
+    st.subheader("活用状況・効果測定")
+    s = db.stats(conn)
+    c1, c2 = st.columns(2)
+    c1.metric("ナレッジ登録数", f"{sum(s['by_layer'].values())} 件")
+    c2.metric("配送前チェック", f"{s['prechecks']} 回")
+    c3, c4 = st.columns(2)
+    c3.metric("トラブル検索", f"{s['searches']} 回")
+    c4.metric("検索で見つかった割合", f"{s['hits'] / s['searches']:.0%}" if s["searches"] else "–")
+    st.metric("未回答の質問", f"{s['open_questions']} 件")
 
-    st.divider()
-    st.subheader("効果測定（全体）")
-    c1, c2, c3, c4 = st.columns(4)  # TODO: 全体の集計値
-    c1.metric("ナレッジ登録件数", "–")
-    c2.metric("検索ヒット率", "–")
-    c3.metric("自己解決率", "–")
-    c4.metric("未回答ギャップ", "–")
-    st.markdown("**質問ログ**")
-    st.dataframe(DUMMY_LOG, hide_index=True, use_container_width=True)  # TODO: 質問ログ
+    st.markdown("**情報源ごとの登録数**")
+    names = dict(DISPLAY)
+    st.bar_chart(pd.DataFrame({"件数": [s["by_layer"].get(l, 0) for l, _ in DISPLAY]},
+                              index=[names[l] for l, _ in DISPLAY]))
+
+    st.markdown("**よく検索された言葉**（見つからなかった回数が多い＝ナレッジが足りない）")
+    if s["top_queries"]:
+        st.dataframe(pd.DataFrame(s["top_queries"]), hide_index=True, use_container_width=True)
+    else:
+        st.caption("まだ検索されていません")
+
+    st.markdown("**役に立ったナレッジ**")
+    if s["top_helpful"]:
+        for h in s["top_helpful"]:
+            st.caption(f"👍 {h['helpful']}　{h['title']}（{names.get(h['layer'], h['layer'])}）")
+    else:
+        st.caption("まだ評価されていません")
 
 # ── フッター ──────────────────────────────────────────────────
 st.divider()

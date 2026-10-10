@@ -29,10 +29,15 @@ from query_processor import process_question
 # -------------------------------------------------------
 # ２：検索対象の定義
 
-LAYERS = ("manual", "report", "experience")
+LAYERS = ("manual", "report", "local_rule", "experience")
         # "manual"      → 社内マニュアル
         # "report"      → クレーム・事故報告書
+        # "local_rule"  → 現地ルール  ★喜藤・仮追加（10/10）：MTGで4種類に決定したため
         # "experience"  → ベテラン経験知
+
+# ★喜藤・仮追加（10/10）：配送前チェック（検索ワードなし）で「直近◯日」に絞る情報源
+#   報告書と経験値は直近のものだけ、現地ルールとマニュアルは期間を問わず表示する
+RECENT_LAYERS = ("report", "experience")
 
         # () タプル      → 作成後に要素を変更できない
         #                → 今回の3種類は固定なので、タプルでOK
@@ -98,6 +103,7 @@ def _as_ui_entry(raw: dict, layer: str) -> dict:
     source_names = {
         "manual": "社内マニュアル",
         "report": "クレーム・事故報告書",
+        "local_rule": "現地ルール",      # ★喜藤・仮追加（10/10）
         "experience": "ベテランの経験知"
     }
 
@@ -140,7 +146,28 @@ def _as_ui_entry(raw: dict, layer: str) -> dict:
 
         # DB上の識別IDを取得
         "id": raw.get("id"),
+
+        # ★喜藤・仮追加（10/10）：画面で使う項目
+        "title": raw.get("title") or "",            # タイトル
+        "time_band": raw.get("time_band") or "",    # 時間帯（早朝・日中・夜間）
+        "created_at": raw.get("created_at") or "",  # 登録日（新しい順の並べ替えに使う）
+        "helpful": raw.get("helpful") or 0,         # 「役に立った」の数
     }
+
+
+# ★喜藤・仮追加（10/10）：時間帯の絞り込み（時間帯が空の情報は、どの時間帯でも残す）
+def _matches_time(entry: dict, time_band: Optional[str]) -> bool:
+    return not time_band or not entry.get("time_band") or entry.get("time_band") == time_band
+
+
+# ★喜藤・仮追加（10/10）：登録日が直近 days 日以内か
+def _is_recent(entry: dict, days: int) -> bool:
+    from datetime import datetime, timedelta
+    created = entry.get("created_at") or ""
+    try:
+        return datetime.fromisoformat(created) >= datetime.now() - timedelta(days=days)
+    except ValueError:
+        return False
 
 # -------------------------------------------------------
 # ５：検索全体の実行：　search_all_sources() の定義
@@ -153,6 +180,8 @@ def search_all_sources(
         engines: Mapping[str, Any],
         locations: Optional[list[str]] = None,
         top_n: int = 20,
+        time_band: Optional[str] = None,     # ★喜藤・仮追加（10/10）：時間帯（早朝・日中・夜間）
+        recent_days: int = 30,               # ★喜藤・仮追加（10/10）：配送前チェックで表示する期間
     ) -> dict[str, list[dict]]:
     """ 各情報源の SearchEngine.search() を個別に呼ぶ """
 
@@ -220,6 +249,19 @@ def search_all_sources(
 
         # 検索候補を1件ずつ確認し、条件に合うものだけを残す
         filtered = [e for e in candidates if _matches_filters(e, category, effective_location)]
+
+        # ★喜藤・仮追加（10/10）：時間帯で絞る
+        filtered = [e for e in filtered if _matches_time(e, time_band)]
+
+        # ★喜藤・仮追加（10/10）：配送前チェック（検索ワードなし）の扱い（MTG決定事項）
+        #   ・その行き先の情報だけを出す（配送先が空の共通情報は出さない）
+        #   ・報告書と経験値は直近 recent_days 日以内に絞る
+        #   ・新しい順に並べる
+        if not parsed["search_query"]:
+            filtered = [e for e in filtered if (e.get("location") or "") == effective_location]
+            if layer in RECENT_LAYERS:
+                filtered = [e for e in filtered if _is_recent(e, recent_days)]
+            filtered.sort(key=lambda e: e.get("created_at") or "", reverse=True)
 
         # ※ ↓ 通常の for 文の場合 
         # filtered = []
